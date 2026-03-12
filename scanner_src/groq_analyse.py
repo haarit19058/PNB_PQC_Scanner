@@ -27,14 +27,14 @@ for index, row in data.iterrows():
     domain_url = row.get('Domain (URL)', 'Unknown URL')
     
     # Skip rows that failed the initial scan
-    if row.get('Scan_Status') == 'Failed':
-        print(f"Skipping {domain_url} (Failed initial scan)")
-        analysis_results.append({
-            "URL": domain_url,
-            "Is_PQC_Safe": "Unknown",
-            "Rectification_Steps": "Cannot analyze; initial TLS scan failed."
-        })
-        continue
+    # if row.get('Scan_Status') == 'Failed':
+    #     print(f"Skipping {domain_url} (Failed initial scan)")
+    #     analysis_results.append({
+    #         "URL": domain_url,
+    #         "Is_PQC_Safe": "Unknown",
+    #         "Rectification_Steps": "Cannot analyze; initial TLS scan failed."
+    #     })
+    #     continue
 
     print(f"Analyzing: {domain_url}...")
 
