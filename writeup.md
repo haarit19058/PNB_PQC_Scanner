@@ -146,3 +146,31 @@ This is why we added the Key_Exchange_Algorithm column to your CBOM. For modern 
 
 So certs are still in rsa.
 For public websites, true end-to-end PQC does not yet exist because while the key exchange is quantum-safe, public Certificate Authorities have not yet upgraded to issuing Post-Quantum certificates.
+
+
+
+# openssl commands
+echo "Q" | openssl s_client  -provider oqsprovider -connect google.com:443 -groups X25519MLKEM768
+echo "Q" | openssl s_client  -provider oqsprovider -connect google.com:443 -groups X25519MLKEM768
+
+echo "Q" | openssl s_client  -provider oqsprovider -connect linkedin.com:443 -groups X25519MLKEM768
+
+
+
+openssl list -kem-algorithms -provider oqsprovider
+
+
+
+# Scoring of algorithms
+
+The calculate_nist_score() function categorizes domains based on cryptographic agility and strength:
+
+    A+ (Quantum-Resilient): The domain successfully negotiates a connection using X25519MLKEM768 (or similar PQC KEMs). This aligns with NIST FIPS 203.
+
+    B (Classical Strong): The domain rejects PQC but successfully negotiates TLS 1.3 with strong keys (RSA ≥ 2048 or ECC ≥ 256). This adheres strictly to NIST SP 800-52 Rev 2 guidelines for current classical setups.
+
+    B- (Classical Acceptable): Falls back to TLS 1.2 with strong keys. Still compliant, but less optimal than TLS 1.3.
+
+    C (Weak): Uses compliant TLS versions but weak key parameters (e.g., RSA 1024-bit).
+
+    F (Non-Compliant): Uses deprecated TLS versions (TLS 1.1 or SSLv3).

@@ -32,21 +32,119 @@ def get_public_key_details(cert):
     try:
         public_key = cert.public_key()
         if isinstance(public_key, rsa.RSAPublicKey):
-            return "RSA", str(public_key.key_size)
+            return "RSA", public_key.key_size
         elif isinstance(public_key, ec.EllipticCurvePublicKey):
-            return f"ECC ({public_key.curve.name})", str(public_key.key_size)
+            return f"ECC ({public_key.curve.name})", public_key.key_size
         elif isinstance(public_key, dsa.DSAPublicKey):
-            return "DSA", str(public_key.key_size)
-        return "Unknown Classical", str(getattr(public_key, "key_size", "Unknown"))
+            return "DSA", public_key.key_size
+        return "Unknown Classical", getattr(public_key, "key_size", 0)
     except UnsupportedAlgorithm:
         oid = cert.signature_algorithm_oid.dotted_string
         if oid in PQC_OIDS:
-            return f"PQC ({PQC_OIDS[oid]})", "N/A"
-        return "Unsupported/Unknown", "N/A"
+            return f"PQC ({PQC_OIDS[oid]})", 0 
+        return "Unsupported/Unknown", 0
 
-def scan_classical(url, hostname, port=443):
-    """Standard Python SSL Scan (Classical Defaults)"""
-    row_data = {"Domain (URL)": url, "Hostname": hostname, "Scan_Type": "Classical", "Scan_Status": "Success", "Error_Details": ""}
+def calculate_nist_score(is_pqc_success, tls_version, key_type, key_size):
+    if is_pqc_success:
+        return "A+ (Quantum-Resilient: Supports ML-KEM)"
+    if tls_version not in ["TLSv1.2", "TLSv1.3"]:
+        return "F (Non-Compliant: Deprecated TLS Version)"
+    if "RSA" in key_type and key_size < 2048:
+        return "C (Weak: RSA key size < 2048 bits)"
+    if "ECC" in key_type and key_size < 256:
+        return "C (Weak: ECC key size < 256 bits)"
+    if tls_version == "TLSv1.3":
+        return "B (Classical Strong: TLS 1.3)"
+    return "B- (Classical Acceptable: TLS 1.2)"
+
+def parse_cert_to_dict(cert, row_data, tls_version, cipher_suite, is_pqc_success=False):
+    """Parses X509 cert and applies the exact CBOM Table 9 format."""
+    try:
+        cn = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
+    except IndexError:
+        cn = row_data["Hostname"]
+
+    key_type, key_size = get_public_key_details(cert)
+    now = datetime.now(timezone.utc)
+    key_state = "Active" if cert.not_valid_before_utc <= now <= cert.not_valid_after_utc else "Expired/Revoked"
+
+    cert_oid = cert.signature_algorithm_oid.dotted_string
+    pqc_algo = PQC_OIDS.get(cert_oid, None)
+    alg_name = pqc_algo if pqc_algo else getattr(cert.signature_algorithm_oid, '_name', "Unknown")
+
+    nist_score = calculate_nist_score(is_pqc_success, tls_version, key_type, key_size)
+
+    row_data.update({
+        "NIST_Security_Score": nist_score,
+        "Alg_Name": alg_name,
+        "Alg_Asset_Type": "algorithm",
+        "Alg_Primitive": "signature" if "RSA" in alg_name.upper() or "ECDSA" in alg_name.upper() or pqc_algo else "key exchange",
+        "Alg_Mode": "gcm" if cipher_suite and "GCM" in cipher_suite else "cbc" if cipher_suite and "CBC" in cipher_suite else "Unknown",
+        "Alg_Crypto_Functions": "encryption, decryption, authentication" if cipher_suite else "signature verification",
+        "Alg_Classical_Security_Level": f"{key_size} bits" if key_size else "N/A",
+        "Alg_OID": cert_oid,
+        "Key_Name": f"{cn} {key_type} Key",
+        "Key_Asset_Type": "key",
+        "Key_id": str(cert.serial_number),
+        "Key_state": key_state,
+        "Key_size": f"{key_size} bits",
+        "Key_Creation_Date": cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "Key_Activation_Date": cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "Protocol_Name": "TLS",
+        "Protocol_Asset_Type": "protocol",
+        "Protocol_Version": tls_version,
+        "Protocol_Cipher_Suites": cipher_suite,
+        "Protocol_OID": "N/A", 
+        "Cert_Name": cn,
+        "Cert_Asset_Type": "certificate",
+        "Cert_Subject_Name": cert.subject.rfc4514_string(),
+        "Cert_Issuer_Name": cert.issuer.rfc4514_string(),
+        "Cert_Not_Valid_Before": cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "Cert_Not_Valid_After": cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "Cert_Signature_Algorithm_Reference": alg_name,
+        "Cert_Subject_Public_Key_Reference": f"{key_type} {key_size}-bit",
+        "Cert_Format": "X.509",
+        "Cert_Extension": ".crt"
+    })
+    return row_data
+
+def scan_pqc(hostname, port=443):
+    row_data = {"Hostname": hostname, "Scan_Type": "PQC Probe", "Scan_Status": "Success", "Error_Details": ""}
+    cmd = [
+        "/usr/bin/openssl", "s_client", 
+        "-provider", "default", "-provider", "oqsprovider", 
+        "-connect", f"{hostname}:{port}", "-groups", "X25519MLKEM768", "-showcerts"
+    ]
+    try:
+        result = subprocess.run(cmd, input="Q\n", capture_output=True, text=True, timeout=15)
+        output = result.stdout + result.stderr
+        
+        failure_triggers = ["handshake failure", "alert number 40", "invalid argument", "errno=104", "no peer certificate available", "Cipher is (NONE)"]
+        if any(trigger in output for trigger in failure_triggers):
+            row_data["Scan_Status"] = "Failed"
+            row_data["Error_Details"] = "Server rejected PQC Key Exchange"
+            return row_data
+
+        tls_match = re.search(r"Protocol\s*:\s*(TLSv1\.[2-3])", output) or re.search(r"New,\s*(TLSv1\.[2-3])", output)
+        tls_version = tls_match.group(1).strip() if tls_match else "Unknown"
+        cipher_match = re.search(r"Cipher\s*:\s*([A-Za-z0-9_]+)", output) or re.search(r"Cipher is\s*([A-Za-z0-9_]+)", output)
+        cipher_suite = cipher_match.group(1).strip() if cipher_match else "Unknown"
+
+        cert_match = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", output, re.DOTALL)
+        if not cert_match:
+            row_data["Scan_Status"] = "Failed"
+            row_data["Error_Details"] = "No certificate returned"
+            return row_data
+            
+        cert = x509.load_pem_x509_certificate(cert_match.group(0).encode('utf-8'))
+        return parse_cert_to_dict(cert, row_data, tls_version, cipher_suite, is_pqc_success=True)
+    except Exception as e:
+        row_data["Scan_Status"] = "Failed"
+        row_data["Error_Details"] = str(e)
+        return row_data
+
+def scan_classical(hostname, port=443):
+    row_data = {"Hostname": hostname, "Scan_Type": "Classical Fallback", "Scan_Status": "Success", "Error_Details": ""}
     context = ssl.create_default_context()
     try:
         with socket.create_connection((hostname, port), timeout=10) as sock:
@@ -56,107 +154,7 @@ def scan_classical(url, hostname, port=443):
                 der_cert = ssock.getpeercert(binary_form=True)
                 
         cert = x509.load_der_x509_certificate(der_cert)
-        return parse_cert_to_dict(cert, row_data, tls_version, cipher_suite, "Classical (Standard)")
-    except Exception as e:
-        row_data["Scan_Status"] = "Failed"
-        row_data["Error_Details"] = str(e)
-        return row_data
-
-def parse_cert_to_dict(cert, row_data, tls_version, cipher_suite, kem_alg):
-    """Parses X509 cert and applies the CBOM dictionary format."""
-    try:
-        cn = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
-    except IndexError:
-        cn = row_data["Hostname"]
-
-    key_type, key_size = get_public_key_details(cert)
-    now = datetime.now(timezone.utc)
-    key_state = "Active" if cert.not_valid_before_utc <= now <= cert.not_valid_after_utc else "Expired/Inactive"
-
-    cert_oid = cert.signature_algorithm_oid.dotted_string
-    pqc_algo = PQC_OIDS.get(cert_oid, None)
-    
-    # If the certificate is PQC (like Dilithium), use that name. Otherwise, use the classical name (like RSA/ECDSA)
-    alg_name = pqc_algo if pqc_algo else cert.signature_algorithm_oid._name
-
-    # --- CBOM FORMAT ---
-    row_data.update({
-        # --- PROTOCOLS ---
-        "Protocol_Name": "TLS",
-        "Protocol_Version": tls_version,
-        "Protocol_Cipher_Suite": cipher_suite,
-        "Key_Exchange_Algorithm": kem_alg, 
-        
-        # --- CERTIFICATES ---
-        "Cert_Name": cn,
-        "Cert_Subject_Name": cert.subject.rfc4514_string(),
-        "Cert_Issuer_Name": cert.issuer.rfc4514_string(),
-        "Cert_Not_Valid_Before": cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "Cert_Not_Valid_After": cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "Cert_Signature_Algorithm": alg_name,
-        "Cert_Public_Key_Ref": f"{key_type} {key_size}-bit",
-        "Cert_Format": "X.509",
-        
-        # --- KEYS ---
-        "Key_ID_Serial": str(cert.serial_number),
-        "Key_State": key_state,
-        "Key_Size": f"{key_size} bits",
-        "Key_Activation_Date": cert.not_valid_before_utc.strftime("%Y-%m-%d"),
-        
-        # --- ALGORITHMS ---
-        "Alg_Name": alg_name,
-        "Alg_Primitive": "signature",
-        "Alg_Classical_Security_Level": f"Matches {key_size}-bit {key_type} strength",
-        "Alg_OID": cert_oid,
-    })
-    
-    return row_data
-
-def scan_pqc(url, hostname, port=443):
-    """OQS Subprocess Scan (Forcing PQC ML-KEM Key Exchange)"""
-    row_data = {"Domain (URL)": url, "Hostname": hostname, "Scan_Type": "PQC Probe", "Scan_Status": "Success", "Error_Details": ""}
-    
-    cmd = [
-        "/usr/bin/openssl", "s_client", 
-        "-provider", "default", 
-        "-provider", "oqsprovider", 
-        "-connect", f"{hostname}:{port}", 
-        "-groups", "X25519MLKEM768", 
-        "-showcerts"
-    ]
-    
-    try:
-        # Pass "Q\n" to mimic typing Q to quit, preventing hangs
-        result = subprocess.run(cmd, input="Q\n", capture_output=True, text=True, timeout=15)
-        output = result.stdout + result.stderr
-        
-        # 1. Check for specific handshake failures (like meta.com)
-        if "handshake failure" in output or "alert number 40" in output or "invalid argument" in output:
-            row_data["Scan_Status"] = "Failed"
-            row_data["Error_Details"] = "Server rejected PQC Key Exchange (Classical Only)"
-            return row_data
-
-        # 2. Extract TLS Version & Cipher (like google.com)
-        tls_match = re.search(r"Protocol\s*:\s*(TLSv1\.[2-3])", output) or re.search(r"New,\s*(TLSv1\.[2-3])", output)
-        tls_version = tls_match.group(1).strip() if tls_match else "Unknown"
-
-        cipher_match = re.search(r"Cipher\s*:\s*([A-Za-z0-9_]+)", output) or re.search(r"Cipher is\s*([A-Za-z0-9_]+)", output)
-        cipher_suite = cipher_match.group(1).strip() if cipher_match else "Unknown"
-
-        # 3. Extract the Certificate Block
-        cert_match = re.search(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", output, re.DOTALL)
-        if not cert_match:
-            row_data["Scan_Status"] = "Failed"
-            row_data["Error_Details"] = "No certificate returned by server"
-            return row_data
-            
-        pem_cert = cert_match.group(0).encode('utf-8')
-        cert = x509.load_pem_x509_certificate(pem_cert)
-        
-        # If we got here, the PQC Key Exchange was successful. 
-        # The Certificate itself might still be Classical (RSA/ECDSA), which parse_cert_to_dict will detect.
-        return parse_cert_to_dict(cert, row_data, tls_version, cipher_suite, "X25519MLKEM768")
-
+        return parse_cert_to_dict(cert, row_data, tls_version, cipher_suite, is_pqc_success=False)
     except Exception as e:
         row_data["Scan_Status"] = "Failed"
         row_data["Error_Details"] = str(e)
@@ -169,16 +167,22 @@ def generate_batch_cbom(url_list, output_filename="Batch_CBOM.csv"):
         hostname = clean_hostname(url)
         print(f"\nScanning {hostname}...")
         
-        print("  -> Running Classical Probe...")
-        all_cbom_data.append(scan_classical(url, hostname))
+        # 1. Try PQC First
+        result = scan_pqc(hostname)
         
-        print("  -> Running PQC Probe...")
-        all_cbom_data.append(scan_pqc(url, hostname))
+        # 2. If PQC fails, fallback to Classical
+        if result["Scan_Status"] == "Failed":
+            print(f"  -> PQC rejected ({result['Error_Details']}). Falling back to Classical...")
+            result = scan_classical(hostname)
+        else:
+            print("  -> PQC Probe Successful!")
+            
+        all_cbom_data.append(result)
         
     df = pd.DataFrame(all_cbom_data)
     
-    # Reorder columns slightly to put key info at the front
-    front_cols = ["Hostname", "Scan_Type", "Scan_Status", "Key_Exchange_Algorithm", "Alg_Name", "Protocol_Cipher_Suite"]
+    # Organize columns
+    front_cols = ["Hostname", "Scan_Type", "Scan_Status", "NIST_Security_Score"]
     remaining_cols = [c for c in df.columns if c not in front_cols]
     df = df[front_cols + remaining_cols]
     
@@ -187,65 +191,10 @@ def generate_batch_cbom(url_list, output_filename="Batch_CBOM.csv"):
     return df
 
 if __name__ == "__main__":
-    target_urls = [
-        # IIT / academic
-        "iitk.ac.in",
-        "iitgn.ac.in",
-        "iitb.ac.in",
-        "iitd.ac.in",
-        "iisc.ac.in",
-        "mit.edu",
-        "stanford.edu",
-        "cmu.edu",
-
-        # PQC / crypto research
-        "test.openquantumsafe.org",
-        "openquantumsafe.org",
-        "pq.cloudflareresearch.com",
-        "pq.cloudflareresearch.net",
-        "cryptrec.go.jp",
-
-        # Big tech
-        "google.com",
-        "microsoft.com",
-        "apple.com",
-        "amazon.com",
-        "meta.com",
-        "openai.com",
-        "groq.com",
-
-        # CDN / security
-        "cloudflare.com",
-        "fastly.com",
-        "akamai.com",
-        "imperva.com",
-        "sucuri.net",
-
-        # TLS testing sites
-        "badssl.com",
-        "tls-v1-0.badssl.com",
-        "tls-v1-1.badssl.com",
-        "sha256.badssl.com",
-        "expired.badssl.com",
-
-        # developer / infra
-        "github.com",
-        "gitlab.com",
-        "docker.com",
-        "kubernetes.io",
-        "nginx.org",
-
-        # misc high-traffic
-        "wikipedia.org",
-        "reddit.com",
-        "stackoverflow.com",
-        "twitter.com",
-        "linkedin.com"
-    ]
-    
+    target_urls = ["google.com", "linkedin.com", "cloudflare.com"]
     df_result = generate_batch_cbom(target_urls)
     
-    print("\nPreview of DataFrame:")
     pd.set_option('display.max_columns', None)
     pd.set_option('display.width', 1000)
-    print(df_result[["Hostname", "Scan_Type", "Scan_Status", "Key_Exchange_Algorithm", "Alg_Name"]].head(8))
+    print("\nPreview:")
+    print(df_result[["Hostname", "Scan_Type", "Scan_Status", "NIST_Security_Score"]].head(6))
